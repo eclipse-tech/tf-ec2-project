@@ -1,0 +1,39 @@
+###############################################################
+# app/docker-compose.yml
+# Run on EC2: docker compose up -d
+# Set env vars before running (or create a .env file)
+###############################################################
+
+version: "3.9"
+
+services:
+  flask-app:
+    build: .
+    image: myapp-flask:latest
+    container_name: myapp-flask
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # PostgreSQL is installed on the EC2 host — reach it via host.docker.internal
+      DB_HOST: host.docker.internal
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-appdb}
+      DB_USER: ${DB_USER:-appuser}
+      DB_PASS: ${DB_PASS:-changeme}
+    volumes:
+      # Bind-mount log dir so CloudWatch Agent on host can read app logs
+      - /var/log/app:/var/log/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION:-ap-south-1}
+        awslogs-group: /ec2/myapp/docker
+        awslogs-stream: myapp-flask
+        awslogs-create-group: "true"
+
+networks:
+  default:
+    name: myapp-network

@@ -1,0 +1,22 @@
+###############################################################
+# docker-compose.yml  (root — used by userdata.sh.tpl)
+# This starts the sample nginx container on first boot.
+# For the real Flask app, use app/docker-compose.yml
+###############################################################
+
+version: "3.9"
+
+services:
+  sample-app:
+    image: nginx:alpine
+    container_name: sample-app
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION:-ap-south-1}
+        awslogs-group: /ec2/myapp/docker
+        awslogs-stream: sample-app
+        awslogs-create-group: "true"
