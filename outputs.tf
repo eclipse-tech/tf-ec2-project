@@ -14,15 +14,16 @@ output "ec2_public_dns" {
 
 output "ssh_command" {
   description = "SSH command to connect to the instance"
-  value       = "ssh -i ~/.ssh/id_rsa ubuntu@${aws_instance.main.public_ip}"
+  value       = "ssh -i ~/.ssh/ec2_key ubuntu@${aws_instance.main.public_ip}"
 }
 
 output "cloudwatch_log_groups" {
   description = "CloudWatch log group names"
   value = {
-    app    = aws_cloudwatch_log_group.app.name
-    system = aws_cloudwatch_log_group.system.name
-    docker = aws_cloudwatch_log_group.docker.name
+    app      = aws_cloudwatch_log_group.app.name
+    system   = aws_cloudwatch_log_group.system.name
+    docker   = aws_cloudwatch_log_group.docker.name
+    database = aws_cloudwatch_log_group.database.name
   }
 }
 

@@ -6,6 +6,8 @@ Runs in Docker on EC2, connects to PostgreSQL on host, ships logs to CloudWatch.
 import os
 import logging
 import json
+import time
+from collections import deque
 from datetime import datetime
 
 from flask import Flask, jsonify, request
@@ -38,10 +40,44 @@ DB_CONFIG = {
     "password": os.environ.get("DB_PASS", "changeme"),
 }
 
+ORIGINAL_DB_HOST = DB_CONFIG["host"]
+REQUIRED_TABLES = ("users", "events")
+QUERY_AUDIT = deque(maxlen=500)
+
 
 def get_db_connection():
     """Return a new psycopg2 connection."""
-    return psycopg2.connect(**DB_CONFIG)
+    cfg = dict(DB_CONFIG)
+    cfg.setdefault("connect_timeout", 5)
+    return psycopg2.connect(**cfg)
+
+
+def execute_sql(cur, query, params=None, context="sql"):
+    """Execute SQL while recording a structured audit trail and timings."""
+    started = time.perf_counter()
+    audit_item = {
+        "time": datetime.utcnow().isoformat() + "Z",
+        "context": context,
+        "query": " ".join(query.split()),
+        "ok": False,
+    }
+    try:
+        if params is None:
+            cur.execute(query)
+        else:
+            cur.execute(query, params)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        audit_item["ok"] = True
+        audit_item["duration_ms"] = elapsed_ms
+        QUERY_AUDIT.append(audit_item)
+        logger.info("SQL OK [%s] %.3fms %s", context, elapsed_ms, audit_item["query"])
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        audit_item["duration_ms"] = elapsed_ms
+        audit_item["error"] = str(exc)
+        QUERY_AUDIT.append(audit_item)
+        logger.error("SQL FAIL [%s] %.3fms %s -- %s", context, elapsed_ms, audit_item["query"], exc)
+        raise
 
 
 def init_db():
@@ -49,7 +85,7 @@ def init_db():
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute("""
+            execute_sql(cur, """
                 CREATE TABLE IF NOT EXISTS users (
                     id         SERIAL PRIMARY KEY,
                     name       VARCHAR(120) NOT NULL,
@@ -62,7 +98,7 @@ def init_db():
                     payload    JSONB,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
-            """)
+            """, context="init_db")
             conn.commit()
         conn.close()
         logger.info("Database tables initialised successfully")
@@ -95,6 +131,86 @@ def health():
         return jsonify({"status": "unhealthy", "database": str(exc)}), 500
 
 
+@app.route("/ops/db-status", methods=["GET"])
+def db_status():
+    """Deep DB verification: connectivity, required tables, and active queries."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            execute_sql(
+                cur,
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = ANY(%s)
+                ORDER BY table_name;
+                """,
+                (list(REQUIRED_TABLES),),
+                context="ops.db_status.tables",
+            )
+            table_rows = cur.fetchall()
+            execute_sql(
+                cur,
+                """
+                SELECT pid, usename, datname, state, query
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                ORDER BY query_start DESC NULLS LAST
+                LIMIT 20;
+                """,
+                context="ops.db_status.activity",
+            )
+            activity_rows = cur.fetchall()
+        conn.close()
+
+        found = {r["table_name"] for r in table_rows}
+        missing = [t for t in REQUIRED_TABLES if t not in found]
+        status = "ok" if not missing else "degraded"
+        return jsonify({
+            "status": status,
+            "db_host": DB_CONFIG["host"],
+            "required_tables": list(REQUIRED_TABLES),
+            "missing_tables": missing,
+            "active_queries": [dict(r) for r in activity_rows],
+            "recent_query_audit": list(QUERY_AUDIT)[-30:],
+        }), 200 if status == "ok" else 503
+    except Exception as exc:
+        logger.error("ops/db-status blocked: %s", exc)
+        return jsonify({
+            "status": "blocked",
+            "db_host": DB_CONFIG["host"],
+            "error": str(exc),
+            "recent_query_audit": list(QUERY_AUDIT)[-30:],
+        }), 503
+
+
+@app.route("/ops/query-audit", methods=["GET"])
+def query_audit():
+    """Return recent SQL query execution audit (application-level)."""
+    return jsonify({"count": len(QUERY_AUDIT), "items": list(QUERY_AUDIT)})
+
+
+@app.route("/ops/db-host", methods=["POST"])
+def set_db_host():
+    """Override DB host to simulate failures or recover after mitigation."""
+    data = request.get_json(silent=True) or {}
+    host = (data.get("host") or "").strip()
+    if not host:
+        return jsonify({"error": "host is required"}), 400
+    DB_CONFIG["host"] = host
+    logger.warning("DB host overridden by ops endpoint: %s", host)
+    return jsonify({"message": "db host updated", "db_host": DB_CONFIG["host"]})
+
+
+@app.route("/ops/db-host/reset", methods=["POST"])
+def reset_db_host():
+    """Reset DB host to original value from startup env."""
+    DB_CONFIG["host"] = ORIGINAL_DB_HOST
+    logger.info("DB host reset to original: %s", ORIGINAL_DB_HOST)
+    return jsonify({"message": "db host reset", "db_host": DB_CONFIG["host"]})
+
+
 # ── Users CRUD ───────────────────────────────────────────────────────────────
 
 @app.route("/users", methods=["GET"])
@@ -102,7 +218,7 @@ def get_users():
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, name, email, created_at FROM users ORDER BY id;")
+            execute_sql(cur, "SELECT id, name, email, created_at FROM users ORDER BY id;", context="users.list")
             rows = cur.fetchall()
         conn.close()
         logger.info("GET /users — returned %d rows", len(rows))
@@ -117,7 +233,7 @@ def get_user(user_id):
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM users WHERE id = %s;", (user_id,))
+            execute_sql(cur, "SELECT * FROM users WHERE id = %s;", (user_id,), context="users.get")
             row = cur.fetchone()
         conn.close()
         if row is None:
@@ -141,9 +257,11 @@ def create_user():
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute(
+            execute_sql(
+                cur,
                 "INSERT INTO users (name, email) VALUES (%s, %s) RETURNING id;",
                 (name, email),
+                context="users.create",
             )
             new_id = cur.fetchone()[0]
             conn.commit()
@@ -166,7 +284,7 @@ def delete_user(user_id):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM users WHERE id = %s RETURNING id;", (user_id,))
+            execute_sql(cur, "DELETE FROM users WHERE id = %s RETURNING id;", (user_id,), context="users.delete")
             deleted = cur.fetchone()
             conn.commit()
         conn.close()
@@ -186,7 +304,7 @@ def get_events():
     try:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM events ORDER BY created_at DESC LIMIT 50;")
+            execute_sql(cur, "SELECT * FROM events ORDER BY created_at DESC LIMIT 50;", context="events.list")
             rows = cur.fetchall()
         conn.close()
         return jsonify({"events": [dict(r) for r in rows]})
@@ -200,9 +318,11 @@ def _log_event(event_type: str, payload: dict):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute(
+            execute_sql(
+                cur,
                 "INSERT INTO events (event_type, payload) VALUES (%s, %s);",
                 (event_type, json.dumps(payload)),
+                context="events.insert",
             )
             conn.commit()
         conn.close()
@@ -212,7 +332,9 @@ def _log_event(event_type: str, payload: dict):
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
+# Ensure tables are created when running under Gunicorn (module import path).
+init_db()
+
 if __name__ == "__main__":
-    logger.info("Starting Flask app — init DB")
-    init_db()
+    logger.info("Starting Flask app")
     app.run(host="0.0.0.0", port=8080, debug=False)

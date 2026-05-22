@@ -220,6 +220,12 @@ resource "aws_cloudwatch_log_group" "docker" {
   tags              = local.common_tags
 }
 
+resource "aws_cloudwatch_log_group" "database" {
+  name              = "/ec2/${var.project_name}/database"
+  retention_in_days = var.log_retention_days
+  tags              = local.common_tags
+}
+
 ###############################################################
 # Locals
 ###############################################################

@@ -52,6 +52,32 @@ apt-get install -y postgresql postgresql-contrib
 systemctl enable postgresql
 systemctl start postgresql
 
+# Enable SQL logging
+PG_CONF=$(find /etc/postgresql -name postgresql.conf | head -1)
+cat >> "$PG_CONF" <<'PGCONF'
+
+# CloudWatch logging configuration
+log_destination = 'stderr'
+logging_collector = on
+log_directory = '/var/log/postgresql'
+log_filename = 'postgresql-%Y-%m-%d.log'
+log_file_mode = 0640
+log_truncate_on_rotation = off
+log_rotation_age = 1d
+
+log_statement = 'all'
+log_duration = on
+log_min_duration_statement = 0
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+
+log_connections = on
+log_disconnections = on
+log_checkpoints = on
+log_lock_waits = on
+log_temp_files = 0
+log_autovacuum_min_duration = 0
+PGCONF
+
 # Create DB + user
 sudo -u postgres psql <<SQL
 CREATE DATABASE $DB_NAME;
@@ -101,6 +127,12 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
             "file_path": "/var/log/app/*.log",
             "log_group_name": "/ec2/$PROJECT/app",
             "log_stream_name": "{instance_id}/app",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/postgresql/postgresql-*.log",
+            "log_group_name": "/ec2/$PROJECT/database",
+            "log_stream_name": "{instance_id}/postgresql",
             "timezone": "UTC"
           }
         ]
